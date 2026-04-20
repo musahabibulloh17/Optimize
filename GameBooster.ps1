@@ -120,16 +120,19 @@ function Kill-UnnecessaryProcesses {
     $killed  = 0
     $skipped = 0
 
+    # Ambil semua proses sekali, lebih efisien daripada loop query per-proses
+    $allProcesses = Get-Process -ErrorAction SilentlyContinue | Group-Object -Property Name -AsHashTable -AsString
+
     foreach ($proc in $processesToKill) {
-        $running = Get-Process -Name $proc -ErrorAction SilentlyContinue
-        if ($running) {
+        if ($allProcesses[$proc]) {
             try {
+                $running = $allProcesses[$proc]
                 $ramMB = [math]::Round(($running | Measure-Object WorkingSet -Sum).Sum / 1MB, 1)
                 Stop-Process -Name $proc -Force -ErrorAction Stop
                 Write-OK "Killed: $proc  (RAM freed: ~$ramMB MB)"
                 $killed++
             } catch {
-                Write-Warn "Gagal kill: $proc"
+                Write-Warn "Gagal kill: $proc - $_"
             }
         } else {
             $skipped++
@@ -179,14 +182,23 @@ function Set-HighPerformancePower {
 function Disable-TelemetryServices {
     Write-Section "NONAKTIFKAN SERVICES TIDAK PENTING"
 
+    # Batch retrieve semua services sekaligus
+    $allServices = Get-Service -ErrorAction SilentlyContinue
+    $serviceMap = @{}
+    $allServices | ForEach-Object { $serviceMap[$_.Name] = $_ }
+
     foreach ($svc in $servicesToDisable) {
-        $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        $service = $serviceMap[$svc.Name]
         if ($service) {
-            if ($service.Status -eq "Running") {
-                Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+            try {
+                if ($service.Status -eq "Running") {
+                    Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+                }
+                Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction Stop
+                Write-OK "Disabled: $($svc.DisplayName)"
+            } catch {
+                Write-Warn "Gagal disable $($svc.DisplayName): $_"
             }
-            Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
-            Write-OK "Disabled: $($svc.DisplayName)"
         } else {
             Write-Skip "Tidak ada: $($svc.DisplayName)"
         }
@@ -209,18 +221,34 @@ function Clean-TempFiles {
     $totalFreed = 0
     foreach ($path in $paths) {
         if (Test-Path $path) {
-            $sizeBefore = (Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-            Get-ChildItem $path -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-            $totalFreed += $sizeBefore
-            Write-OK "Cleaned: $path"
+            try {
+                # Ambil ukuran sebelum
+                $sizeBefore = 0
+                Get-ChildItem $path -Recurse -Force -ErrorAction SilentlyContinue | 
+                    ForEach-Object { $sizeBefore += $_.Length }
+                
+                # Hapus dengan parallel processing untuk folder besar
+                Get-ChildItem $path -Recurse -Force -ErrorAction SilentlyContinue | 
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+                
+                $totalFreed += $sizeBefore
+                Write-OK "Cleaned: $path"
+            } catch {
+                Write-Warn "Error cleaning $path : $_"
+            }
         }
+    }
+
+    # Flush DNS untuk latency yang lebih baik
+    try {
+        ipconfig /flushdns | Out-Null
+        Write-OK "DNS Cache di-flush (bantu latency online game)"
+    } catch {
+        Write-Skip "Gagal flush DNS"
     }
 
     $freed = [math]::Round($totalFreed / 1MB, 1)
     Write-Host "  Total dibersihkan: ~$freed MB" -ForegroundColor Cyan
-
-    ipconfig /flushdns | Out-Null
-    Write-OK "DNS Cache di-flush (bantu latency online game)"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -229,35 +257,34 @@ function Clean-TempFiles {
 function Set-GameOptimizations {
     Write-Section "OPTIMASI REGISTRY UNTUK GAMING"
 
-    reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" /v AppCaptureEnabled /t REG_DWORD /d 0 /f | Out-Null
-    reg add "HKCU\System\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 0 /f | Out-Null
-    Write-OK "Xbox Game Bar DVR dinonaktifkan"
+    # Helper function untuk mengurangi redundansi registry operations
+    $regOps = @(
+        @{ Path = "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR"; Name = "AppCaptureEnabled"; Value = 0; Type = "REG_DWORD"; Msg = "Xbox Game Bar DVR dinonaktifkan" },
+        @{ Path = "HKCU\System\GameConfigStore"; Name = "GameDVR_Enabled"; Value = 0; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKCU\SOFTWARE\Microsoft\GameBar"; Name = "AllowAutoGameMode"; Value = 1; Type = "REG_DWORD"; Msg = "Windows Game Mode diaktifkan" },
+        @{ Path = "HKCU\SOFTWARE\Microsoft\GameBar"; Name = "AutoGameModeEnabled"; Value = 1; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKCU\System\GameConfigStore"; Name = "GameDVR_FSEBehaviorMode"; Value = 2; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKCU\System\GameConfigStore"; Name = "GameDVR_HonorUserFSEBehaviorMode"; Value = 1; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKCU\System\GameConfigStore"; Name = "GameDVR_DXGIHonorFSEWindowsCompatible"; Value = 1; Type = "REG_DWORD"; Msg = "Fullscreen Optimization dioptimasi" },
+        @{ Path = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"; Name = "GPU Priority"; Value = 8; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"; Name = "Priority"; Value = 6; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"; Name = "Scheduling Category"; Value = "High"; Type = "REG_SZ"; Msg = "GPU dan CPU Priority untuk Games dinaikkan" },
+        @{ Path = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"; Name = "NetworkThrottlingIndex"; Value = "0xffffffff"; Type = "REG_DWORD"; Msg = "" },
+        @{ Path = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"; Name = "SystemResponsiveness"; Value = 0; Type = "REG_DWORD"; Msg = "Network Throttling dinonaktifkan" },
+        @{ Path = "HKCU\Control Panel\Mouse"; Name = "MouseSpeed"; Value = "0"; Type = "REG_SZ"; Msg = "" },
+        @{ Path = "HKCU\Control Panel\Mouse"; Name = "MouseThreshold1"; Value = "0"; Type = "REG_SZ"; Msg = "" },
+        @{ Path = "HKCU\Control Panel\Mouse"; Name = "MouseThreshold2"; Value = "0"; Type = "REG_SZ"; Msg = "Mouse Acceleration dinonaktifkan (aim lebih konsisten di Valorant!)" },
+        @{ Path = "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"; Name = "VisualFXSetting"; Value = 2; Type = "REG_DWORD"; Msg = "Visual Effects Windows dikurangi" }
+    )
 
-    reg add "HKCU\SOFTWARE\Microsoft\GameBar" /v AllowAutoGameMode /t REG_DWORD /d 1 /f | Out-Null
-    reg add "HKCU\SOFTWARE\Microsoft\GameBar" /v AutoGameModeEnabled /t REG_DWORD /d 1 /f | Out-Null
-    Write-OK "Windows Game Mode diaktifkan"
-
-    reg add "HKCU\System\GameConfigStore" /v GameDVR_FSEBehaviorMode /t REG_DWORD /d 2 /f | Out-Null
-    reg add "HKCU\System\GameConfigStore" /v GameDVR_HonorUserFSEBehaviorMode /t REG_DWORD /d 1 /f | Out-Null
-    reg add "HKCU\System\GameConfigStore" /v GameDVR_DXGIHonorFSEWindowsCompatible /t REG_DWORD /d 1 /f | Out-Null
-    Write-OK "Fullscreen Optimization dioptimasi"
-
-    reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "GPU Priority" /t REG_DWORD /d 8 /f | Out-Null
-    reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Priority" /t REG_DWORD /d 6 /f | Out-Null
-    reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" /v "Scheduling Category" /t REG_SZ /d "High" /f | Out-Null
-    Write-OK "GPU dan CPU Priority untuk Games dinaikkan"
-
-    reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /t REG_DWORD /d 0xffffffff /f | Out-Null
-    reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f | Out-Null
-    Write-OK "Network Throttling dinonaktifkan"
-
-    reg add "HKCU\Control Panel\Mouse" /v MouseSpeed /t REG_SZ /d "0" /f | Out-Null
-    reg add "HKCU\Control Panel\Mouse" /v MouseThreshold1 /t REG_SZ /d "0" /f | Out-Null
-    reg add "HKCU\Control Panel\Mouse" /v MouseThreshold2 /t REG_SZ /d "0" /f | Out-Null
-    Write-OK "Mouse Acceleration dinonaktifkan (aim lebih konsisten di Valorant!)"
-
-    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
-    Write-OK "Visual Effects Windows dikurangi"
+    foreach ($op in $regOps) {
+        try {
+            reg add $op.Path /v $op.Name /t $op.Type /d $op.Value /f | Out-Null
+            if ($op.Msg) { Write-OK $op.Msg }
+        } catch {
+            Write-Warn "Gagal set registry $($op.Name): $_"
+        }
+    }
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -323,10 +350,21 @@ function Show-ResourceStats {
 function Restore-NormalSettings {
     Write-Section "RESTORE KE PENGATURAN NORMAL"
 
+    # Batch retrieve services untuk efisiensi
+    $allServices = Get-Service -ErrorAction SilentlyContinue
+    $serviceMap = @{}
+    $allServices | ForEach-Object { $serviceMap[$_.Name] = $_ }
+
     foreach ($svc in $servicesToDisable) {
-        Set-Service -Name $svc.Name -StartupType Automatic -ErrorAction SilentlyContinue
-        Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
-        Write-OK "Restored: $($svc.DisplayName)"
+        if ($serviceMap[$svc.Name]) {
+            try {
+                Set-Service -Name $svc.Name -StartupType Automatic -ErrorAction Stop
+                Start-Service -Name $svc.Name -ErrorAction Stop
+                Write-OK "Restored: $($svc.DisplayName)"
+            } catch {
+                Write-Warn "Gagal restore $($svc.DisplayName): $_"
+            }
+        }
     }
 
     $balanced = powercfg /list | Select-String "Balanced"
@@ -340,9 +378,20 @@ function Restore-NormalSettings {
     powercfg /change hibernate-timeout-ac 30
     Write-OK "Sleep/Hibernate dikembalikan"
 
-    reg add "HKCU\Control Panel\Mouse" /v MouseSpeed /t REG_SZ /d "1" /f | Out-Null
-    reg add "HKCU\Control Panel\Mouse" /v MouseThreshold1 /t REG_SZ /d "6" /f | Out-Null
-    reg add "HKCU\Control Panel\Mouse" /v MouseThreshold2 /t REG_SZ /d "10" /f | Out-Null
+    # Restore mouse settings
+    $mouseSettings = @(
+        @{ Name = "MouseSpeed"; Value = "1" },
+        @{ Name = "MouseThreshold1"; Value = "6" },
+        @{ Name = "MouseThreshold2"; Value = "10" }
+    )
+
+    foreach ($setting in $mouseSettings) {
+        try {
+            reg add "HKCU\Control Panel\Mouse" /v $setting.Name /t REG_SZ /d $setting.Value /f | Out-Null
+        } catch {
+            Write-Warn "Gagal restore mouse setting $($setting.Name)"
+        }
+    }
     Write-OK "Mouse Acceleration dikembalikan ke default"
 
     Write-Host ""
